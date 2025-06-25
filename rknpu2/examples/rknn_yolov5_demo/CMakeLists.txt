@@ -68,7 +68,7 @@ include_directories( ${RGA_PATH}/include)
 set(MPP_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/mpp)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(MPP_LIBS ${MPP_PATH}/${CMAKE_SYSTEM_NAME}/${LIB_ARCH}/librockchip_mpp.so)
+  set(MPP_LIBS ${MPP_PATH}/${CMAKE_SYSTEM_NAME}/${LIB_ARCH}/librockchip_mpp.so.0)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
   set(MPP_LIBS ${MPP_PATH}/${CMAKE_SYSTEM_NAME}/${CMAKE_ANDROID_ARCH_ABI}/libmpp.so)
 endif()
