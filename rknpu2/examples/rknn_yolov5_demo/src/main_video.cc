@@ -36,6 +36,11 @@
 #include "mk_mediakit.h"
 #endif
 
+#include <mutex>
+// 在文件顶部添加全局互斥锁
+static std::mutex rga_mutex,rga_mutex2;
+
+
 #define OUT_VIDEO_PATH "out.h264"
 
 typedef struct
@@ -50,6 +55,7 @@ typedef struct
   FILE *out_fp;
   MppDecoder *decoder;
   MppEncoder *encoder;
+  int mk_rtsp_code;
 } rknn_app_context_t;
 
 typedef struct
@@ -63,9 +69,16 @@ typedef struct
   int fd;
 } image_frame_t;
 
-/*-------------------------------------------
-                  Functions
--------------------------------------------*/
+// 线程参数结构体，添加线程编号成员
+typedef struct {
+    const char *model_name;
+    const char *video_name;
+    int video_type;
+    int thread_id; // 线程编号
+} ThreadArgs;
+
+// 线程函数声明
+void* process_video_thread(void* arg);
 
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
@@ -290,19 +303,24 @@ static int inference_model(rknn_app_context_t *app_ctx, image_frame_t *img, dete
   inputs[0].fmt = RKNN_TENSOR_NHWC;
   inputs[0].pass_through = 0;
 
-  printf("resize with RGA!\n");
+  //打印当前线程编号
+  printf("resize with RGA ,---------------pthread_self :%lu\n", (int)pthread_self());
+
   resize_buf = malloc(model_width * model_height * model_channel);
   memset(resize_buf, 0, model_width * model_height * model_channel);
 
-  src = wrapbuffer_virtualaddr((void *)img->virt_addr, img->width, img->height, img->format, img->width_stride, img->height_stride);
-  dst = wrapbuffer_virtualaddr((void *)resize_buf, model_width, model_height, RK_FORMAT_RGB_888);
-  ret = imcheck(src, dst, src_rect, dst_rect);
-  if (IM_STATUS_NOERROR != ret)
   {
-    printf("%d, check error! %s", __LINE__, imStrError((IM_STATUS)ret));
-    return -1;
+    std::lock_guard<std::mutex> lock(rga_mutex2);
+    src = wrapbuffer_virtualaddr((void *)img->virt_addr, img->width, img->height, img->format, img->width_stride, img->height_stride);
+    dst = wrapbuffer_virtualaddr((void *)resize_buf, model_width, model_height, RK_FORMAT_RGB_888);
+    ret = imcheck(src, dst, src_rect, dst_rect);
+    if (IM_STATUS_NOERROR != ret)
+    {
+      printf("%d, check error! %s", __LINE__, imStrError((IM_STATUS)ret));
+      return -1;
+    }
+    IM_STATUS STATUS = imresize(src, dst);
   }
-  IM_STATUS STATUS = imresize(src, dst);
 
   inputs[0].buf = resize_buf;
 
@@ -318,11 +336,17 @@ static int inference_model(rknn_app_context_t *app_ctx, image_frame_t *img, dete
   }
 
   ret = rknn_run(ctx, NULL);
+  if (ret < 0)
+  {
+    printf("rknn run error %d\n", ret);
+    exit(-1);
+  }
+
   ret = rknn_outputs_get(ctx, app_ctx->io_num.n_output, outputs, NULL);
   gettimeofday(&stop_time, NULL);
   printf("once run use %f ms\n", (__get_us(stop_time) - __get_us(start_time)) / 1000);
 
-  printf("post process config: box_conf_threshold = %.2f, nms_threshold = %.2f\n", box_conf_threshold, nms_threshold);
+  printf("\n\n\n\npost process config: box_conf_threshold = %.2f, nms_threshold = %.2f\n\n\n\n\n", box_conf_threshold, nms_threshold);
 
   std::vector<float> out_scales;
   std::vector<int32_t> out_zps;
@@ -344,6 +368,8 @@ static int inference_model(rknn_app_context_t *app_ctx, image_frame_t *img, dete
   }
   return 0;
 }
+
+
 
 void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_stride, int width, int height, int format, int fd, void *data)
 {
@@ -394,21 +420,32 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
   detect_result_group_t detect_result;
   memset(&detect_result, 0, sizeof(detect_result_group_t));
 
-  ret = inference_model(ctx, &img, &detect_result);
-  if (ret != 0)
+  //完整的视频处理流程通常是：rtsp解码264→处理yuv（直接CV or 推理后CV）→编码264→rtsp推流(传输 或 保存)  or  rtsp解码264→处理yuv→ 本地渲染播放
+  
+  //如果某一路没有配置推理模型，则直接存储到本地
+  if (ctx->rknn_ctx > 0)
   {
-    printf("inference model fail\n");
-    goto RET;
+    //从输入的图片CVmat中，推理做目标检测获取目标检测框：detect_result
+    ret = inference_model(ctx, &img, &detect_result);
+    if (ret != 0)
+    {
+      printf("inference model fail\n");
+      goto RET;
+    }
   }
-
+  
   mpp_frame = ctx->encoder->GetInputFrameBuffer();
   mpp_frame_fd = ctx->encoder->GetInputFrameBufferFd(mpp_frame);
   mpp_frame_addr = ctx->encoder->GetInputFrameBufferAddr(mpp_frame);
 
   // Copy To another buffer avoid to modify mpp decoder buffer
-  origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-  src = wrapbuffer_fd(mpp_frame_fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-  imcopy(origin, src);
+  // 保护RGA拷贝操作
+  {
+    std::lock_guard<std::mutex> lock(rga_mutex);
+    origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+    src = wrapbuffer_fd(mpp_frame_fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+    imcopy(origin, src);
+  }
 
   // Draw objects
   for (int i = 0; i < detect_result.count; i++)
@@ -423,7 +460,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
     draw_rectangle_yuv420sp((unsigned char *)mpp_frame_addr, width_stride, height_stride, x1, y1, x2 - x1 + 1, y2 - y1 + 1, 0x00FF0000, 4);
   }
 
-  // Encode to file
+  // Encode to file，将CV后的图片，重新变为为264存储到文件
   // Write header on first frame
   if (frame_index == 1)
   {
@@ -478,11 +515,10 @@ int process_video_file(rknn_app_context_t *ctx, const char *path)
   return 0;
 }
 
-#if defined(BUILD_VIDEO_RTSP)
 void API_CALL on_track_frame_out(void *user_data, mk_frame frame)
 {
   rknn_app_context_t *ctx = (rknn_app_context_t *)user_data;
-  printf("on_track_frame_out ctx=%p\n", ctx);
+  printf("on_track_frame_out ctx=%p,thread_id=%lu\n", ctx,pthread_self());
   const char *data = mk_frame_get_data(frame);
   size_t size = mk_frame_get_data_size(frame);
   printf("decoder=%p\n", ctx->decoder);
@@ -492,11 +528,11 @@ void API_CALL on_track_frame_out(void *user_data, mk_frame frame)
 void API_CALL on_mk_play_event_func(void *user_data, int err_code, const char *err_msg, mk_track tracks[],
                                     int track_count)
 {
-  rknn_app_context_t *ctx = (rknn_app_context_t *)user_data;
+  //rknn_app_context_t *ctx = (rknn_app_context_t *)user_data;
   if (err_code == 0)
   {
-    // success
-    printf("play success!");
+    // 打印线程信息
+    printf("play success! thread_id=%lu\n", pthread_self());
     int i;
     for (i = 0; i < track_count; ++i)
     {
@@ -516,7 +552,10 @@ void API_CALL on_mk_play_event_func(void *user_data, int err_code, const char *e
 
 void API_CALL on_mk_shutdown_func(void *user_data, int err_code, const char *err_msg, mk_track tracks[], int track_count)
 {
-  printf("play interrupted: %d %s", err_code, err_msg);
+  rknn_app_context_t *ctx = (rknn_app_context_t *)user_data;
+  ctx->mk_rtsp_code = err_code;
+ 
+  printf("\n\n\n\n\nplay interrupted: %d %s \n\n\n\n\n\n\n", err_code, err_msg);
 }
 
 int process_video_rtsp(rknn_app_context_t *ctx, const char *url)
@@ -525,21 +564,112 @@ int process_video_rtsp(rknn_app_context_t *ctx, const char *url)
   memset(&config, 0, sizeof(mk_config));
   config.log_mask = LOG_CONSOLE;
   mk_env_init(&config);
-  mk_player player = mk_player_create();
-  mk_player_set_on_result(player, on_mk_play_event_func, ctx);
-  mk_player_set_on_shutdown(player, on_mk_shutdown_func, ctx);
-  mk_player_play(player, url);
+  
+  int retry_count = 1024;  // 最大重试次数
+  while(retry_count-- > 0) {
+    mk_player player = mk_player_create();
+    ctx->mk_rtsp_code = 0;  // 重置错误码
+    
+    mk_player_set_on_result(player, on_mk_play_event_func, ctx);
+    mk_player_set_on_shutdown(player, on_mk_shutdown_func, ctx);
+    mk_player_play(player, url);
 
-  printf("enter any key to exit\n");
-  getchar();
+    while(ctx->mk_rtsp_code <= 0) {
+      usleep(1000*1000);  // 每100ms检查一次，循环中
+    }
 
-  if (player)
-  {
-    mk_player_release(player);
+    if(ctx->mk_rtsp_code > 0) {
+      mk_player_release(player);
+      printf("RTSP connection failed, retrying... (%d attempts left),thread id: %lu\n", retry_count, (int)pthread_self());
+      usleep(1*1000*1000);  // 等待1秒后重试
+    } else {
+      break;  // 成功则退出循环
+    }
   }
-  return 0;
+
+  if(retry_count <= 0) {
+    printf("Max retry attempts reached, giving up.-------------------------------------------------------\n");
+    printf("\n\n\n\n\n\n\nexit------------------------------------thread id: %lu\n\n\n\n\n\n\n\n", (int)pthread_self());
+    exit(-1);
+  }
+
 }
+
+#define BUILD_VIDEO_RTSP 
+
+// 线程函数定义
+void* process_video_thread(void* arg) {
+    ThreadArgs* args = (ThreadArgs*)arg;
+    int ret;
+
+    //打印线程信息
+    printf("thread %d start,thread_id=%lu\n", args->thread_id,pthread_self());
+
+    rknn_app_context_t app_ctx;
+    memset(&app_ctx, 0, sizeof(rknn_app_context_t));
+
+    if (args->thread_id >= 1 && args->thread_id <= 4) {
+        ret = init_model(args->model_name, &app_ctx);
+        if (ret != 0) {
+            printf("Thread %d: init model fail\n", args->thread_id);
+            return nullptr;
+        }
+    }
+
+    if (app_ctx.decoder == NULL) {
+        MppDecoder *decoder = new MppDecoder();
+        decoder->Init(args->video_type, 30, &app_ctx);
+        decoder->SetCallback(mpp_decoder_frame_callback);
+        app_ctx.decoder = decoder;
+    }
+
+    if (app_ctx.out_fp == NULL) {
+        char out_video_path[256];
+        // 为每个线程生成不同的输出文件名
+        snprintf(out_video_path, sizeof(out_video_path), "out_thread_%d.h264", args->thread_id);
+        FILE *fp = fopen(out_video_path, "w");
+        if (fp == NULL) {
+            printf("Thread %d: open %s error\n", args->thread_id, out_video_path);
+            return nullptr;
+        }
+        app_ctx.out_fp = fp;
+    }
+
+    printf("Thread %d: app_ctx=%p decoder=%p\n", args->thread_id, &app_ctx, app_ctx.decoder);
+
+    if (strncmp(args->video_name, "rtsp", 4) == 0) {
+#if defined(BUILD_VIDEO_RTSP)
+        process_video_rtsp(&app_ctx, args->video_name);
+#else
+        printf("Thread %d: rtsp no support\n", args->thread_id);
 #endif
+    } else {
+        process_video_file(&app_ctx, args->video_name);
+    }
+
+    printf("Thread %d: waiting finish\n", args->thread_id);
+    usleep(3 * 1000 * 1000);
+
+    // release
+    fflush(app_ctx.out_fp);
+    fclose(app_ctx.out_fp);
+
+    if (app_ctx.decoder != nullptr) {
+        delete (app_ctx.decoder);
+        app_ctx.decoder = nullptr;
+    }
+    if (app_ctx.encoder != nullptr) {
+        delete (app_ctx.encoder);
+        app_ctx.encoder = nullptr;
+    }
+
+    if (args->thread_id >= 1 && args->thread_id <= 4) {
+        release_model(&app_ctx);
+    }
+
+    return nullptr;
+}
+
 
 /*-------------------------------------------
                   Main Functions
@@ -547,81 +677,42 @@ int process_video_rtsp(rknn_app_context_t *ctx, const char *url)
 int main(int argc, char **argv)
 {
   int status = 0;
-  int ret;
+
+  //单进程8线程，是由于单个进程内的mpp_decoder_frame_callback 共享资源竞争和上下文切换开销过大导致的，拉流线程卡主，流量上不去。
+  const int thread_num =8;
+  pthread_t threads[thread_num];
+  ThreadArgs args[thread_num];
 
   if (argc != 4)
   {
-    printf("Usage: %s <rknn_model> <video_path> <video_type 264/265> \n", argv[0]);
+    printf("Usage: %s <rknn_model> <video_path_prefix> <video_type 264/265> \n", argv[0]);
     return -1;
   }
 
   char *model_name = (char *)argv[1];
-  char *video_name = argv[2];
+  char *video_path_prefix = argv[2];
   int video_type = atoi(argv[3]);
 
-  rknn_app_context_t app_ctx;
-  memset(&app_ctx, 0, sizeof(rknn_app_context_t));
+  for (int i = 0; i < thread_num; ++i) {
+      args[i].model_name = model_name;
+      args[i].video_name = strdup(video_path_prefix);
+      args[i].video_type = video_type;
+      args[i].thread_id = i + 1; // 设置线程编号
 
-  ret = init_model(model_name, &app_ctx);
-  if (ret != 0)
-  {
-    printf("init model fail\n");
-    return -1;
+      if (pthread_create(&threads[i], NULL, process_video_thread, &args[i]) != 0) {
+          printf("Failed to create thread %d\n", i);
+          return -1;
+      }
+
+      sleep(1);
   }
 
-  if (app_ctx.decoder == NULL)
-  {
-    MppDecoder *decoder = new MppDecoder();
-    decoder->Init(video_type, 30, &app_ctx);
-    decoder->SetCallback(mpp_decoder_frame_callback);
-    app_ctx.decoder = decoder;
+  // 等待所有线程结束
+  for (int i = 0; i < thread_num; ++i) {
+      pthread_join(threads[i], NULL);
+      free((void*)args[i].video_name);
   }
-
-  if (app_ctx.out_fp == NULL)
-  {
-    FILE *fp = fopen(OUT_VIDEO_PATH, "w");
-    if (fp == NULL)
-    {
-      printf("open %s error\n", OUT_VIDEO_PATH);
-      return -1;
-    }
-    app_ctx.out_fp = fp;
-  }
-
-  printf("app_ctx=%p decoder=%p\n", &app_ctx, app_ctx.decoder);
-
-  if (strncmp(video_name, "rtsp", 4) == 0)
-  {
-#if defined(BUILD_VIDEO_RTSP)
-    process_video_rtsp(&app_ctx, video_name);
-#else
-    printf("rtsp no support\n");
-#endif
-  }
-  else
-  {
-    process_video_file(&app_ctx, video_name);
-  }
-
-  printf("waiting finish\n");
-  usleep(3 * 1000 * 1000);
-
-  // release
-  fflush(app_ctx.out_fp);
-  fclose(app_ctx.out_fp);
-
-  if (app_ctx.decoder != nullptr)
-  {
-    delete (app_ctx.decoder);
-    app_ctx.decoder = nullptr;
-  }
-  if (app_ctx.encoder != nullptr)
-  {
-    delete (app_ctx.encoder);
-    app_ctx.encoder = nullptr;
-  }
-
-  release_model(&app_ctx);
 
   return 0;
 }
+
