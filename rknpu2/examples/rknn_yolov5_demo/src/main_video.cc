@@ -15,6 +15,8 @@
 /*-------------------------------------------
                 Includes
 -------------------------------------------*/
+#define BUILD_VIDEO_RTSP 
+
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,16 +34,30 @@
 #include "utils/mpp_decoder.h"
 #include "utils/mpp_encoder.h"
 #include "utils/drawing.h"
+#include "opencv2/core/core.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/imgproc.hpp"
+
 #if defined(BUILD_VIDEO_RTSP)
 #include "mk_mediakit.h"
 #endif
 
 #include <mutex>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 // 在文件顶部添加全局互斥锁
 static std::mutex rga_mutex,rga_mutex2;
 
 
 #define OUT_VIDEO_PATH "out.h264"
+
+typedef struct
+{
+  std::string path;
+  int chn_num;
+  int img_count;
+}chn_info;
 
 typedef struct
 {
@@ -56,6 +72,7 @@ typedef struct
   MppDecoder *decoder;
   MppEncoder *encoder;
   int mk_rtsp_code;
+  chn_info chn_img;
 } rknn_app_context_t;
 
 typedef struct
@@ -422,45 +439,97 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
 
   //完整的视频处理流程通常是：rtsp解码264→处理yuv（直接CV or 推理后CV）→编码264→rtsp推流(传输 或 保存)  or  rtsp解码264→处理yuv→ 本地渲染播放
   
-  //如果某一路没有配置推理模型，则直接存储到本地
+  mpp_frame = ctx->encoder->GetInputFrameBuffer();
+  mpp_frame_fd = ctx->encoder->GetInputFrameBufferFd(mpp_frame);
+  mpp_frame_addr = ctx->encoder->GetInputFrameBufferAddr(mpp_frame);
+
+  // 如果某一路有配置推理模型
   if (ctx->rknn_ctx > 0)
   {
-    //从输入的图片CVmat中，推理做目标检测获取目标检测框：detect_result
+    // 从输入的图片CVmat中，推理做目标检测获取目标检测框：detect_result
     ret = inference_model(ctx, &img, &detect_result);
     if (ret != 0)
     {
       printf("inference model fail\n");
       goto RET;
     }
-  }
-  
-  mpp_frame = ctx->encoder->GetInputFrameBuffer();
-  mpp_frame_fd = ctx->encoder->GetInputFrameBufferFd(mpp_frame);
-  mpp_frame_addr = ctx->encoder->GetInputFrameBufferAddr(mpp_frame);
 
-  // Copy To another buffer avoid to modify mpp decoder buffer
-  // 保护RGA拷贝操作
+    // Copy To another buffer avoid to modify mpp decoder buffer
+    // 保护RGA拷贝操作
+    {
+      std::lock_guard<std::mutex> lock(rga_mutex);
+      origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+      src = wrapbuffer_fd(mpp_frame_fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
+      imcopy(origin, src);
+    }
+
+    // Draw objects
+    for (int i = 0; i < detect_result.count; i++)
+    {
+      detect_result_t *det_result = &(detect_result.results[i]);
+      printf("%s @ (%d %d %d %d) %f\n", det_result->name, det_result->box.left, det_result->box.top,
+             det_result->box.right, det_result->box.bottom, det_result->prop);
+      int x1 = det_result->box.left;
+      int y1 = det_result->box.top;
+      int x2 = det_result->box.right;
+      int y2 = det_result->box.bottom;
+      draw_rectangle_yuv420sp((unsigned char *)mpp_frame_addr, width_stride, height_stride, x1, y1, x2 - x1 + 1, y2 - y1 + 1, 0x00FF0000, 4);
+    }
+
+    img.virt_addr = (char *)mpp_frame_addr;
+  }
+
   {
-    std::lock_guard<std::mutex> lock(rga_mutex);
-    origin = wrapbuffer_fd(fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-    src = wrapbuffer_fd(mpp_frame_fd, width, height, RK_FORMAT_YCbCr_420_SP, width_stride, height_stride);
-    imcopy(origin, src);
+      //每存储25帧图片，新建一个当前时间（ 以月日分秒为规则，如0626151609）的文件夹，再存储25帧图片
+    if (ctx->chn_img.img_count % 25 == 0)
+    {
+      char dir_name[128];
+      // 获取当前时间
+      time_t now = time(NULL);
+      struct tm tm_now;
+      localtime_r(&now, &tm_now);  // 使用线程安全的localtime_r，并将结果复制到局部变量
+
+    // 生成月日分秒格式的目录名 (如0626151609)
+      snprintf(dir_name, sizeof(dir_name), "thread_%d/%02d%02d%02d%02d%02d",
+              ctx->chn_img.chn_num,
+              tm_now.tm_mon + 1,    // 月 (0-11 → 1-12)
+              tm_now.tm_mday,       // 日 
+              tm_now.tm_hour,       // 时
+              tm_now.tm_min,        // 分
+              tm_now.tm_sec);       // 秒
+            
+      if (mkdir(dir_name, 0777) == -1 && errno != EEXIST) {
+          printf("create directory %s error\n", dir_name);
+          return;
+      }
+      printf("create directory -----------------------------------------------------------%s success\n", dir_name);
+
+      ctx->chn_img.path = dir_name;
+      ctx->chn_img.img_count = 0;
+    }
+
+    // 将img 中RK_FORMAT_YCbCr_420_SP格式的图 保存到 ctx->chn_img.path 路径中，按照jpeg方式保存
+    char img_path[128]; 
+    snprintf(img_path, sizeof(img_path), "%s/frame_%d.jpg", ctx->chn_img.path.c_str(), ctx->chn_img.img_count);
+    
+    // 将YUV420SP转换为BGR格式
+    cv::Mat yuv_img(img.height * 3/2, img.width, CV_8UC1, img.virt_addr);
+    cv::Mat bgr_img;
+    cv::cvtColor(yuv_img, bgr_img, cv::COLOR_YUV2BGR_NV12);
+    
+    // 保存为JPEG
+    if (!cv::imwrite(img_path, bgr_img)) {
+        printf("Failed to save image: %s\n", img_path);
+    }
+    
+    ctx->chn_img.img_count++;
+
+    return;
   }
 
-  // Draw objects
-  for (int i = 0; i < detect_result.count; i++)
-  {
-    detect_result_t *det_result = &(detect_result.results[i]);
-    printf("%s @ (%d %d %d %d) %f\n", det_result->name, det_result->box.left, det_result->box.top,
-           det_result->box.right, det_result->box.bottom, det_result->prop);
-    int x1 = det_result->box.left;
-    int y1 = det_result->box.top;
-    int x2 = det_result->box.right;
-    int y2 = det_result->box.bottom;
-    draw_rectangle_yuv420sp((unsigned char *)mpp_frame_addr, width_stride, height_stride, x1, y1, x2 - x1 + 1, y2 - y1 + 1, 0x00FF0000, 4);
-  }
 
-  // Encode to file，将CV后的图片，重新变为为264存储到文件
+#if 0
+  // Encode to file，将CV后的图片，重新编码为264存储到文件
   // Write header on first frame
   if (frame_index == 1)
   {
@@ -470,6 +539,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
   memset(enc_data, 0, enc_buf_size);
   enc_data_size = ctx->encoder->Encode(mpp_frame, enc_data, enc_buf_size);
   fwrite(enc_data, 1, enc_data_size, ctx->out_fp);
+#endif
 
 RET:
   if (enc_data != nullptr)
@@ -595,7 +665,6 @@ int process_video_rtsp(rknn_app_context_t *ctx, const char *url)
 
 }
 
-#define BUILD_VIDEO_RTSP 
 
 // 线程函数定义
 void* process_video_thread(void* arg) {
@@ -632,6 +701,16 @@ void* process_video_thread(void* arg) {
             printf("Thread %d: open %s error\n", args->thread_id, out_video_path);
             return nullptr;
         }
+
+        //各线程分别创建到1-16 号16个通道文件夹
+        app_ctx.chn_img.chn_num =  args->thread_id;
+        char dir_name[64];  
+        snprintf(dir_name, sizeof(dir_name), "thread_%d", args->thread_id);
+        if (mkdir(dir_name, 0777) == -1 && errno != EEXIST) {
+            printf("Thread %d: create directory %s error\n", args->thread_id, dir_name);
+        }
+        
+
         app_ctx.out_fp = fp;
     }
 
@@ -679,7 +758,7 @@ int main(int argc, char **argv)
   int status = 0;
 
   //单进程8线程，是由于单个进程内的mpp_decoder_frame_callback 共享资源竞争和上下文切换开销过大导致的，拉流线程卡主，流量上不去。
-  const int thread_num =8;
+  const int thread_num =5;
   pthread_t threads[thread_num];
   ThreadArgs args[thread_num];
 
