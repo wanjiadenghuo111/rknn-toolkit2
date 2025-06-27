@@ -46,6 +46,28 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <semaphore.h>
+#include <unistd.h>
+
+#define MAX_CHANNELS 16
+#define MAX_IMAGE_SIZE (1920*1080*3/2) // 最大支持1080p YUV420SP图像
+
+typedef struct {
+    int width;
+    int height;
+    int format;
+    size_t size;
+    bool updated;
+    sem_t sem;
+} SharedImageHeader;
+
+typedef struct {
+    SharedImageHeader header;
+    unsigned char data[];
+} SharedImage;
 // 在文件顶部添加全局互斥锁
 static std::mutex rga_mutex;
 
@@ -73,6 +95,8 @@ typedef struct
   MppEncoder *encoder;
   int mk_rtsp_code;
   chn_info chn_img;
+  int shm_fd[MAX_CHANNELS];  // 每个通道的共享内存文件描述符
+  SharedImage* shared_img[MAX_CHANNELS]; // 映射的共享内存指针
 } rknn_app_context_t;
 
 typedef struct
@@ -423,6 +447,8 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
     ctx->encoder = mpp_encoder;
   }
 
+
+
   int enc_buf_size = ctx->encoder->GetFrameSize();
   char *enc_data = (char *)malloc(enc_buf_size);
 
@@ -439,10 +465,42 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
 
   //完整的视频处理流程通常是：rtsp解码264→处理yuv（直接CV or 推理后CV）→编码264→rtsp推流(传输 或 保存)  or  rtsp解码264→处理yuv→ 本地渲染播放
   
-  mpp_frame = ctx->encoder->GetInputFrameBuffer();
-  mpp_frame_fd = ctx->encoder->GetInputFrameBufferFd(mpp_frame);
-  mpp_frame_addr = ctx->encoder->GetInputFrameBufferAddr(mpp_frame);
+  // mpp_frame = ctx->encoder->GetInputFrameBuffer();
+  // mpp_frame_fd = ctx->encoder->GetInputFrameBufferFd(mpp_frame);
+  // mpp_frame_addr = ctx->encoder->GetInputFrameBufferAddr(mpp_frame);
 
+#if 1
+  {
+    // 使用 共享内存 rk yolo 和 ax clip 两个进行之间 传递 8-16路 img 数据
+    //  获取当前通道号
+    int chn_num = ctx->chn_img.chn_num;
+
+    // 加锁保护共享内存访问
+    sem_wait(&ctx->shared_img[chn_num]->header.sem);
+
+    // 填充共享内存数据
+    ctx->shared_img[chn_num]->header.width = width;
+    ctx->shared_img[chn_num]->header.height = height;
+    ctx->shared_img[chn_num]->header.format = format;
+    ctx->shared_img[chn_num]->header.size = width * height * 3 / 2;
+    //memcpy(ctx->shared_img[chn_num]->data, data, ctx->shared_img[chn_num]->header.size);
+     // 使用RGA硬件加速拷贝YUV数据
+    {
+        std::lock_guard<std::mutex> lock(rga_mutex);
+        rga_buffer_t src = wrapbuffer_virtualaddr((void *)data, width, height, RK_FORMAT_YCbCr_420_SP);
+        rga_buffer_t dst = wrapbuffer_virtualaddr((void *)ctx->shared_img[chn_num]->data, width, height, RK_FORMAT_YCbCr_420_SP);
+        IM_STATUS status = imcopy(src, dst);
+        if (status != IM_STATUS_SUCCESS) {
+            printf("RGA copy failed: %s\n", imStrError(status));
+        }
+    }
+    
+    ctx->shared_img[chn_num]->header.updated = true;
+
+    // 解锁
+    sem_post(&ctx->shared_img[chn_num]->header.sem);
+  }
+#endif
 
   // 如果某一路有配置推理模型
   if (ctx->rknn_ctx > 0)
@@ -455,6 +513,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
       goto RET;
     }
 
+  #if 0
     // Copy To another buffer avoid to modify mpp decoder buffer
     // 保护RGA拷贝操作
     {
@@ -478,22 +537,12 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
     }
 
     img.virt_addr = (char *)mpp_frame_addr;
-  }
-  else
-  {
-    //使用 共享内存 rk yolo 和 ax clip 两个进行之间 传递 8-16路 img 数据
-
-
-
-
-
-
-    
+#endif
 
   }
   
 
-
+  
 #if 0
   {
       //每存储25帧图片，新建一个当前时间（ 以月日分秒为规则，如0626151609）的文件夹，再存储25帧图片
@@ -524,7 +573,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
       ctx->chn_img.img_count = 0;
     }
 
-    // 将img 中RK_FORMAT_YCbCr_420_SP格式的图 保存到 ctx->chn_img.path 路径中，按照jpeg方式保存
+    // 将img 中RK_FORMAT_YCbCr_420_SP格式的图 保存到 ctx->chn_img.path 路径中，按照bmp方式保存
     char img_path[128]; 
     snprintf(img_path, sizeof(img_path), "%s/frame_%d.bmp", ctx->chn_img.path.c_str(), ctx->chn_img.img_count);
     
@@ -699,6 +748,67 @@ int process_video_rtsp(rknn_app_context_t *ctx, const char *url)
 
 }
 
+// 清理共享内存资源
+void cleanup_shared_memory(rknn_app_context_t* ctx, int chn_num) {
+    if (ctx->shared_img[chn_num]) {
+        size_t mem_size = sizeof(SharedImageHeader) + MAX_IMAGE_SIZE;
+        munmap(ctx->shared_img[chn_num], mem_size);
+        ctx->shared_img[chn_num] = nullptr;
+    }
+    if (ctx->shm_fd[chn_num] != -1) {
+        close(ctx->shm_fd[chn_num]);
+        ctx->shm_fd[chn_num] = -1;
+    }
+}
+
+// 初始化共享内存
+void init_shared_memory(rknn_app_context_t* ctx, int chn_num) {
+    char shm_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/rk_yolo_shm_%d", chn_num);
+    
+    // 创建或打开共享内存
+    ctx->shm_fd[chn_num] = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+    if (ctx->shm_fd[chn_num] == -1) {
+        perror("shm_open failed");
+        return;
+    }
+
+    // 设置共享内存大小
+    size_t mem_size = sizeof(SharedImageHeader) + MAX_IMAGE_SIZE;
+    if (ftruncate(ctx->shm_fd[chn_num], mem_size) == -1) {
+        perror("ftruncate failed");
+        close(ctx->shm_fd[chn_num]);
+        return;
+    }
+
+    // 映射共享内存
+    ctx->shared_img[chn_num] = (SharedImage*)mmap(NULL, mem_size, 
+                                               PROT_READ | PROT_WRITE, 
+                                               MAP_SHARED, ctx->shm_fd[chn_num], 0);
+    if (ctx->shared_img[chn_num] == MAP_FAILED) {
+        perror("mmap failed");
+        close(ctx->shm_fd[chn_num]);
+        return;
+    }
+
+  // 初始化信号量
+    if (sem_init(&ctx->shared_img[chn_num]->header.sem, 1, 1) == -1) {
+        perror("sem_init failed");
+        fprintf(stderr, "信号量初始化失败，错误号: %d\n", errno);
+        munmap(ctx->shared_img[chn_num], mem_size);
+        close(ctx->shm_fd[chn_num]);
+        return;
+    }
+
+    // 测试信号量
+    if (sem_post(&ctx->shared_img[chn_num]->header.sem) == -1) {
+        perror("信号量测试失败");
+        munmap(ctx->shared_img[chn_num], mem_size);
+        close(ctx->shm_fd[chn_num]);
+        exit(0);
+    }
+}
+
 
 // 线程函数定义
 void* process_video_thread(void* arg) {
@@ -748,7 +858,7 @@ void* process_video_thread(void* arg) {
             printf("Thread %d: create directory %s error\n", args->thread_id, dir_name);
         }
         
-
+        init_shared_memory(&app_ctx, args->thread_id);
     }
 
     printf("Thread %d: app_ctx=%p decoder=%p\n", args->thread_id, &app_ctx, app_ctx.decoder);
@@ -765,6 +875,9 @@ void* process_video_thread(void* arg) {
 
     printf("Thread %d: waiting finish\n", args->thread_id);
     usleep(3 * 1000 * 1000);
+
+
+    cleanup_shared_memory(&app_ctx, args->thread_id);
 
     // release
     fflush(app_ctx.out_fp);
@@ -831,6 +944,7 @@ int main(int argc, char **argv)
       free((void*)args[i].video_name);
   }
 
+ 
   return 0;
 }
 
