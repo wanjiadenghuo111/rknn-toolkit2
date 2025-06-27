@@ -47,7 +47,7 @@
 #include <sys/types.h>
 #include <errno.h>
 // 在文件顶部添加全局互斥锁
-static std::mutex rga_mutex,rga_mutex2;
+static std::mutex rga_mutex;
 
 
 #define OUT_VIDEO_PATH "out.h264"
@@ -327,7 +327,7 @@ static int inference_model(rknn_app_context_t *app_ctx, image_frame_t *img, dete
   memset(resize_buf, 0, model_width * model_height * model_channel);
 
   {
-    std::lock_guard<std::mutex> lock(rga_mutex2);
+    std::lock_guard<std::mutex> lock(rga_mutex);
     src = wrapbuffer_virtualaddr((void *)img->virt_addr, img->width, img->height, img->format, img->width_stride, img->height_stride);
     dst = wrapbuffer_virtualaddr((void *)resize_buf, model_width, model_height, RK_FORMAT_RGB_888);
     ret = imcheck(src, dst, src_rect, dst_rect);
@@ -443,6 +443,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
   mpp_frame_fd = ctx->encoder->GetInputFrameBufferFd(mpp_frame);
   mpp_frame_addr = ctx->encoder->GetInputFrameBufferAddr(mpp_frame);
 
+
   // 如果某一路有配置推理模型
   if (ctx->rknn_ctx > 0)
   {
@@ -478,7 +479,22 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
 
     img.virt_addr = (char *)mpp_frame_addr;
   }
+  else
+  {
+    //使用 共享内存 rk yolo 和 ax clip 两个进行之间 传递 8-16路 img 数据
 
+
+
+
+
+
+    
+
+  }
+  
+
+
+#if 0
   {
       //每存储25帧图片，新建一个当前时间（ 以月日分秒为规则，如0626151609）的文件夹，再存储25帧图片
     if (ctx->chn_img.img_count % 25 == 0)
@@ -490,7 +506,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
       localtime_r(&now, &tm_now);  // 使用线程安全的localtime_r，并将结果复制到局部变量
 
     // 生成月日分秒格式的目录名 (如0626151609)
-      snprintf(dir_name, sizeof(dir_name), "thread_%d/%02d%02d%02d%02d%02d",
+      snprintf(dir_name, sizeof(dir_name), "/userdata/clip/thread_%d/%02d%02d%02d%02d%02d",
               ctx->chn_img.chn_num,
               tm_now.tm_mon + 1,    // 月 (0-11 → 1-12)
               tm_now.tm_mday,       // 日 
@@ -500,7 +516,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
             
       if (mkdir(dir_name, 0777) == -1 && errno != EEXIST) {
           printf("create directory %s error\n", dir_name);
-          return;
+          goto RET;
       }
       printf("create directory -----------------------------------------------------------%s success\n", dir_name);
 
@@ -510,23 +526,41 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
 
     // 将img 中RK_FORMAT_YCbCr_420_SP格式的图 保存到 ctx->chn_img.path 路径中，按照jpeg方式保存
     char img_path[128]; 
-    snprintf(img_path, sizeof(img_path), "%s/frame_%d.jpg", ctx->chn_img.path.c_str(), ctx->chn_img.img_count);
+    snprintf(img_path, sizeof(img_path), "%s/frame_%d.bmp", ctx->chn_img.path.c_str(), ctx->chn_img.img_count);
     
-    // 将YUV420SP转换为BGR格式
-    cv::Mat yuv_img(img.height * 3/2, img.width, CV_8UC1, img.virt_addr);
-    cv::Mat bgr_img;
-    cv::cvtColor(yuv_img, bgr_img, cv::COLOR_YUV2BGR_NV12);
-    
-    // 保存为JPEG
-    if (!cv::imwrite(img_path, bgr_img)) {
-        printf("Failed to save image: %s\n", img_path);
+    //CV保存jpeg图片 太消耗 CPU，换位rga算子
+    // 使用RGA进行YUV420SP到BGR转换
+    #if 1
+    cv::Mat bgr_img(img.height, img.width, CV_8UC3);
+    {
+        std::lock_guard<std::mutex> lock(rga_mutex);
+        rga_buffer_t src = wrapbuffer_virtualaddr((void *)img.virt_addr, img.width, img.height, RK_FORMAT_YCbCr_420_SP, img.width_stride, img.height_stride);
+        rga_buffer_t dst = wrapbuffer_virtualaddr((void *)bgr_img.data, img.width, img.height, RK_FORMAT_BGR_888);
+        IM_STATUS status = imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888);
+        if (status != IM_STATUS_SUCCESS) {
+            printf("RGA convert color failed: %s\n", imStrError(status));
+            goto RET;
+        }
     }
+    #endif
+
+    // 将YUV420SP转换为BGR格式
+    // cv::Mat yuv_img(img.height * 3/2, img.width, CV_8UC1, img.virt_addr);
+    // cv::Mat bgr_img;
+    // cv::cvtColor(yuv_img, bgr_img, cv::COLOR_YUV2BGR_NV12);
     
+    //保存为 PNG、BMP 等格式，这些格式支持无损保存原始像素数据，不用压缩
+    //BMP 6M左右，CPU消耗很少，但是消耗大量IO时间片，CPU空转等待（需要改为异步保存），导致拉流卡主，磁盘很快爆掉
+    //25p*6m*8路 =1000MB 每秒，异步磁盘吃不消
+    if (!cv::imwrite(img_path, bgr_img)) {
+       printf("Failed to save image: %s\n", img_path);
+    }
+
     ctx->chn_img.img_count++;
 
-    return;
   }
 
+#endif
 
 #if 0
   // Encode to file，将CV后的图片，重新编码为264存储到文件
@@ -677,7 +711,7 @@ void* process_video_thread(void* arg) {
     rknn_app_context_t app_ctx;
     memset(&app_ctx, 0, sizeof(rknn_app_context_t));
 
-    if (args->thread_id >= 1 && args->thread_id <= 4) {
+    if (args->thread_id >= 1 && args->thread_id <= 2) {
         ret = init_model(args->model_name, &app_ctx);
         if (ret != 0) {
             printf("Thread %d: init model fail\n", args->thread_id);
@@ -694,6 +728,8 @@ void* process_video_thread(void* arg) {
 
     if (app_ctx.out_fp == NULL) {
         char out_video_path[256];
+       
+        #if 0
         // 为每个线程生成不同的输出文件名
         snprintf(out_video_path, sizeof(out_video_path), "out_thread_%d.h264", args->thread_id);
         FILE *fp = fopen(out_video_path, "w");
@@ -701,17 +737,18 @@ void* process_video_thread(void* arg) {
             printf("Thread %d: open %s error\n", args->thread_id, out_video_path);
             return nullptr;
         }
+        app_ctx.out_fp = fp;
+        #endif
 
         //各线程分别创建到1-16 号16个通道文件夹
         app_ctx.chn_img.chn_num =  args->thread_id;
         char dir_name[64];  
-        snprintf(dir_name, sizeof(dir_name), "thread_%d", args->thread_id);
+        snprintf(dir_name, sizeof(dir_name), "/userdata/clip/thread_%d", args->thread_id);
         if (mkdir(dir_name, 0777) == -1 && errno != EEXIST) {
             printf("Thread %d: create directory %s error\n", args->thread_id, dir_name);
         }
         
 
-        app_ctx.out_fp = fp;
     }
 
     printf("Thread %d: app_ctx=%p decoder=%p\n", args->thread_id, &app_ctx, app_ctx.decoder);
@@ -758,7 +795,9 @@ int main(int argc, char **argv)
   int status = 0;
 
   //单进程8线程，是由于单个进程内的mpp_decoder_frame_callback 共享资源竞争和上下文切换开销过大导致的，拉流线程卡主，流量上不去。
-  const int thread_num =5;
+  //  //ctx->decoder->Decode((uint8_t *)data, size, 0); 去掉这一行，16路的流量就可以按照相机的静态码率拉到
+  //--需要做全链路异步化改造： 拉流异步化 ，解码异步化，推理异步化……
+  const int thread_num =8;
   pthread_t threads[thread_num];
   ThreadArgs args[thread_num];
 
