@@ -484,7 +484,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
     ctx->shared_img[chn_num]->header.format = format;
     ctx->shared_img[chn_num]->header.size = width * height * 3 / 2;
     //memcpy(ctx->shared_img[chn_num]->data, data, ctx->shared_img[chn_num]->header.size);
-     // 使用RGA硬件加速拷贝YUV数据
+    // 使用RGA硬件加速拷贝YUV数据
     {
         std::lock_guard<std::mutex> lock(rga_mutex);
         rga_buffer_t src = wrapbuffer_virtualaddr((void *)data, width, height, RK_FORMAT_YCbCr_420_SP);
@@ -496,13 +496,14 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
     }
     
     ctx->shared_img[chn_num]->header.updated = true;
-
+    printf("-------------------RGA copy updated: %d \n",chn_num);
     // 解锁
     sem_post(&ctx->shared_img[chn_num]->header.sem);
   }
 #endif
 
   // 如果某一路有配置推理模型
+  //if(0)
   if (ctx->rknn_ctx > 0)
   {
     // 从输入的图片CVmat中，推理做目标检测获取目标检测框：detect_result
@@ -540,9 +541,7 @@ void mpp_decoder_frame_callback(void *userdata, int width_stride, int height_str
 #endif
 
   }
-  
-
-  
+    
 #if 0
   {
       //每存储25帧图片，新建一个当前时间（ 以月日分秒为规则，如0626151609）的文件夹，再存储25帧图片
@@ -821,7 +820,7 @@ void* process_video_thread(void* arg) {
     rknn_app_context_t app_ctx;
     memset(&app_ctx, 0, sizeof(rknn_app_context_t));
 
-    if (args->thread_id >= 1 && args->thread_id <= 2) {
+    if (args->thread_id >= 1 && args->thread_id <= 4) {
         ret = init_model(args->model_name, &app_ctx);
         if (ret != 0) {
             printf("Thread %d: init model fail\n", args->thread_id);
